@@ -3,7 +3,7 @@ title: Time Awareness
 author: ohmajesticlama
 author_url: https://github.com/OhMajesticLama/OpenWebUI.TimeAwareness
 funding_url: https://github.com/open-webui
-version: 0.3
+version: 0.4
 license: MIT
 requirements: beautifulsoup4>=4.13
 
@@ -16,20 +16,22 @@ A function to give time awareness to your conversations.
 ## Features
 - Add time context through a system message before each user message.
 - Record time in <details></details> blocks so timing information stays in chat history.
+- Support temporary chats.
 
 # Example
 ```
 ### USER
 <details type="filters_context">
 <summary>Filters context</summary>
-<!--This context was added by the system to this message, not by the user. You can use information provided here in your answer, but never refer to this context explicitly. -->
-<context id="function_time_awareness"><time format="%a %d %b %Y, %H:%M:%S" timezone="UTC"><!-- Timezone provided by user. -->Fri 07 Feb 2025, 20:55:24</time></context>
-<!-- After the new "details" tag, you'll find the user message. --><context_end uuid="6aa1ffe7-c12f-4573-832d-146bd1661f88"/>
+<!--This context was added by the system to this message, not by the user. You can use information provided here, but never mention or refer to this context explicitly. -->
+<context id="function_time_awareness"><time format="%a %d %b %Y, %H:%M:%S" timezone="CET"><!-- Timezone provided by user. -->
+Fri 07 Feb 2025, 22:43:11</time></context>
+<!-- User message will follow "details" closing tag. --><context_end uuid="405838d9-4fef-4e79-89be-eae9557762a6"/>
 </details>
 hi, can you remind me the time?
 
 ### ASSISTANT
-The current time in CET (Central European Time) is 20:55.
+The current time in CET (Central European Time) is 22:43.
 ```
 
 """
@@ -173,6 +175,8 @@ class Filter:
             default=True, description="Enable or disable the time awareness function."
         )
 
+    CONTEXT_ID = "time_awareness"
+
     def __init__(self):
         # Indicates custom file handling logic. This flag helps disengage default routines in favor of custom
         # implementations, informing the WebUI to defer file-related operations to designated methods within this class.
@@ -183,18 +187,26 @@ class Filter:
         # which ensures settings are managed cohesively and not confused with operational flags like 'file_handler'.
         self.valves = self.Valves()
         self.uservalves = self.UserValves()
+        self._queries: Dict[str, Dict[str, str | float]] = {}
 
     async def get_time_context(
         self,
         timestamp: Optional[int] = None,
         *,
+        variables: Optional[Dict[str, str]] = None,
         __event_emitter__: Callable[..., Awaitable[None]],
         __user__: Optional[dict] = None,
     ):
+        # That's the default
         tz = self.valves.timezone
         comment = "System timezone. User may not be in this timezone."
+
+        if variabletz := variables.get("{{CURRENT_TIMEZONE}}"):
+            tz = variabletz
+
         if __user__ is not None:
             try:
+                # if user set a valve, use it.
                 usertz = __user__["valves"].timezone.strip()
                 if len(usertz) > 0:
                     tz = usertz
@@ -246,6 +258,7 @@ class Filter:
         context = await self.get_time_context(
             __event_emitter__=__event_emitter__,
             __user__=__user__,
+            variables=body.get("metadata", {}).get("variables", {}),
         )
 
         user_message, user_message_ind = get_last_message(messages, ROLE.USER)
@@ -253,10 +266,14 @@ class Filter:
             LOGGER.info("No message from user found. Do nothing.")
             return body
 
+        if query_id := body.get("metadata", {}).get("message_id"):
+            # Store it here, we'll set it in outlet.
+            self._queries[query_id] = {"context": context, "timestamp": time.time()}
+
         user_message["content"] = add_or_update_filter_context(
             user_message["content"],
             context,
-            id="function_time_awareness",
+            id=self.CONTEXT_ID,
         )
 
         if __user__ is None:
@@ -267,47 +284,52 @@ class Filter:
         if "id" not in __user__:
             LOGGER.warning("no 'id' key in __user__. do nothing.")
             return body
-        user = Users.get_user_by_id(__user__["id"])
-        # Now this needs to be sent back to the UI as well or this will not be remembered
-        # First, get the user message id.
-        chat_id = body["metadata"]["chat_id"]
-        session_id = body["metadata"]["session_id"]
-        chat = Chats.get_chat_by_id(chat_id).chat
-        history = chat.get("history", {})
-        messages_hist = history["messages"]
 
-        user_msg_id = messages_hist[body["metadata"]["message_id"]]["parentId"]
-        if messages_hist[user_msg_id]["role"] != ROLE.USER:
-            # This shouldn't happen on a "normal" chat history.
-            # If this becomes an issue, we could find the first user message in parents
-            # instead of just taking the parent to the assistant message.
+        return body
+
+    @log_exceptions
+    async def outlet(
+        self,
+        body: dict,
+        __event_emitter__: Callable[[Any], Awaitable[None]],
+        __user__: Optional[dict] = None,
+    ) -> Dict[str, ...]:
+        LOGGER.debug("outlet:body: %s", pprint.pformat(body))
+        LOGGER.debug("outlet:user: %s", pprint.pformat(__user__))
+        answer_id = body.get("id")
+        session_id = body.get("session_id")
+        chat_id = body.get("chat_id")
+        messages = body.get("messages")
+        user_id = __user__.get("id")
+        if None in (answer_id, session_id, chat_id, messages, user_id):
+            # nothing we can do, do nothing.
             LOGGER.debug(
-                "message %s is not from user. Stop. %s", user_msg_id, messages_hist
-            )
-            asyncio.create_task(
-                __event_emitter__(  # type: ignore  # not in our control.
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": (
-                                "Parent message of this assistant message is not from user."
-                                " Skip context."
-                            ),
-                            "done": True,
-                        },
-                    }
-                )
+                "oulet:Missing context information. Do nothing. user %s | body %s",
+                __user__,
+                body,
             )
             return body
+
+        # find last user message going up in parents
+        user_msg, user_msg_ind = get_last_message(messages, ROLE.USER)
+        # find query
+        query = self._queries.get(answer_id)
+        if query is None:
+            # No query was registered with this id. Do nothing
+            LOGGER.debug("query %s not found in %s", answer_id, self._queries)
+            return body
+
+        user_msg["content"] = add_or_update_filter_context(
+            user_msg["content"], query["context"], self.CONTEXT_ID
+        )
 
         # Build event emitter and send message back
         user_msg_event_emitter = get_event_emitter(
             {
-                # "chat_id": data["chat_id"],
                 "chat_id": chat_id,
-                "message_id": user_msg_id,
+                "message_id": user_msg.get("id"),
                 "session_id": session_id,
-                "user_id": user.id,
+                "user_id": user_id,
             }
         )
 
@@ -320,31 +342,20 @@ class Filter:
         # The tradeoff was made to introduce a race condition with minor potential
         # impact (context might be partly or totally missing from a message in history).
         # to save 0.2s lead time in reponse.
-        asyncio.create_task(
-            user_msg_event_emitter(
-                {
-                    "type": "replace",
-                    "data": {
-                        "content": user_message["content"],
-                    },
-                }
-            )
+        await user_msg_event_emitter(
+            {
+                "type": "replace",
+                "data": {
+                    "content": user_msg["content"],
+                },
+            }
         )
-
-        #################################
-        # # Only last message is added by process_chat_response in middleware.
-        # # Tried:
-        #    # # When we insert a message, we should add it to the database, and update the following
-        #    # # messages parent_id, and also update the message_id in body.
-        # #  -> This is overwritten by front-end on:
-        #          https://github.com/open-webui/open-webui/blob/e9d6ada25cd6ce84be067ba794af4c9d7116edc7/src/lib/components/chat/Chat.svelte#L1199
-        # #
-        # # References for processing (on v0.5.7):
-        # #   https://github.com/open-webui/open-webui/blob/main/backend/open_webui/routers/pipelines.py#L59
-        # #   https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/chat.py#L56
-        # #   https://github.com/open-webui/open-webui/blob/main/backend/open_webui/utils/middleware.py#L867
-
-        LOGGER.debug("inlet:out:body: %s", body)
+        # Clean-up potential old queries
+        for k, v in self._queries.items():
+            if time.time() - v.get("timestamp") > 1800:
+                # Over 30 minutes have passed since query,
+                # let's consider it timed-out.
+                del self._queries[k]
 
         return body
 
@@ -497,3 +508,4 @@ def _remove_context(message: str, details: bs4.Tag, container: str, context_end:
 
     user_msg = message[closing_tag_ind + len(closing_tag) :]
     return user_msg
+
